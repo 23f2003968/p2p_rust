@@ -350,8 +350,13 @@ impl P2PNode {
     }
 
     pub fn get_addresses(&self, swarm: &Swarm<ChatBehaviour>) -> Vec<String> {
-        swarm
-            .listeners()
+        let addrs: Vec<Multiaddr> = swarm.listeners().cloned().collect();
+        
+        // Filter to only public IPv6 addresses (removes fe80::, ::1, etc.)
+        let filtered = filter_ipv6_public_addrs(&addrs);
+        
+        filtered
+            .iter()
             .map(|addr| format!("{}/p2p/{}", addr, self.peer_id))
             .collect()
     }
@@ -418,18 +423,15 @@ impl P2PNode {
                     }
                     info!("mDNS discovered peer: {} at {}", peer_id, multiaddr);
                     
-                    if !self.discovered_peers.contains(&peer_id) {
-                        self.discovered_peers.insert(peer_id);
-                        self.send_system_message(format!("🔍 mDNS discovered peer: {}", self.short_peer_id(&peer_id.to_string())));
-                        
-                        // Filter to IPv6 public addresses only
-                        let filtered_addrs = filter_ipv6_public_addrs(&[multiaddr.clone()]);
-                        if !filtered_addrs.is_empty() {
-                            self.send_system_message(format!("Attempting to dial {} via IPv6", self.short_peer_id(&peer_id.to_string())));
-                        } else {
-                            self.send_system_message(format!("⚠ Peer {} has no reachable IPv6 addresses", self.short_peer_id(&peer_id.to_string())));
-                        }
+                    // Check if already connected
+                    if self.connected_peers.contains_key(&peer_id) {
+                        continue;
                     }
+                    
+                    self.send_system_message(format!("🔍 mDNS discovered peer: {}", self.short_peer_id(&peer_id.to_string())));
+                    
+                    // Queue this peer for dialing
+                    self.peers_to_dial.push(peer_id);
                 }
             }
             SwarmEvent::Behaviour(ChatBehaviourEvent::Mdns(mdns::Event::Expired(peers))) => {
