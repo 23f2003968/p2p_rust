@@ -185,6 +185,19 @@ async fn connect_to_peer(addr: String, state: State<'_, P2PState>) -> Result<(),
     }
 }
 
+#[tauri::command]
+async fn cleanup_p2p(state: State<'_, P2PState>) -> Result<(), String> {
+    let mut state_guard = state.lock().await;
+    
+    if state_guard.is_some() {
+        // Drop the handle which will close the command channel
+        *state_guard = None;
+        Ok(())
+    } else {
+        Err("P2P node not initialized".to_string())
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tracing_subscriber::fmt::init();
@@ -200,7 +213,8 @@ pub fn run() {
             get_node_info,
             join_room,
             send_message,
-            connect_to_peer
+            connect_to_peer,
+            cleanup_p2p
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

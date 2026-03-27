@@ -20,9 +20,17 @@ const copiedIndex = ref(-1);
 
 // Event listener cleanup
 let unlisten = null;
+let initializationAttempted = false;
 
 // Initialize P2P node
 async function initP2P() {
+  // Prevent multiple initialization attempts
+  if (initializationAttempted) {
+    console.log('P2P initialization already attempted, skipping...');
+    return;
+  }
+  initializationAttempted = true;
+  
   try {
     const id = await invoke('init_p2p');
     peerID.value = id;
@@ -34,6 +42,8 @@ async function initP2P() {
   } catch (error) {
     console.error('Failed to initialize P2P:', error);
     addSystemMessage('❌ Failed to initialize P2P node: ' + error);
+    // Reset flag on error to allow retry if needed
+    initializationAttempted = false;
   }
 }
 
@@ -167,9 +177,16 @@ onMounted(async () => {
   await initP2P();
 });
 
-onUnmounted(() => {
+onUnmounted(async () => {
   if (unlisten) unlisten();
   window.removeEventListener('keydown', handleKeydown);
+  
+  // Cleanup P2P node
+  try {
+    await invoke('cleanup_p2p');
+  } catch (error) {
+    console.error('Failed to cleanup P2P:', error);
+  }
 });
 </script>
 
