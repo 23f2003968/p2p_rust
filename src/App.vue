@@ -1,315 +1,566 @@
 <script setup>
-import { ref, onMounted, onUnmounted, nextTick } from 'vue';
+import { ref, computed, onMounted, onUnmounted } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 
-// State
-const messages = ref([]);
-const inputMessage = ref('');
+// Component imports
+import Header from './components/Header.vue';
+import Addresses from './components/Addresses.vue';
+import Messages from './components/Messages.vue';
+import Sidebar from './components/Sidebar.vue';
+import InputArea from './components/InputArea.vue';
+import LoadingBar from './components/LoadingBar.vue';
+import ConnectPeerModal from './components/ConnectPeerModal.vue';
+import JoinRoomModal from './components/JoinRoomModal.vue';
+
+// ============================================================================
+// STATE - Core data
+// ============================================================================
+
 const peerID = ref('');
 const addresses = ref([]);
-const connectedPeers = ref([]);
 const isInitialized = ref(false);
-const joinRoomMode = ref(false);
-const connectPeerMode = ref(false);
-const roomInput = ref('');
+const currentEvent = ref('');
+const inputMessage = ref('');
+
+const contacts = ref(new Map());
+const activeContactId = ref(null);
+const showChatView = ref(false);
+const username = ref('');
+
+// Dialog States
+const showConnectModal = ref(false);
+const showJoinModal = ref(false);
 const peerAddressInput = ref('');
-const currentRoom = ref('');
-const messagesContainer = ref(null);
-const copiedIndex = ref(-1);
+const roomInput = ref('');
+
+// Component refs
+const messagesRef = ref(null);
+const sidebarRef = ref(null);
 
 // Event listener cleanup
-let unlisten = null;
+let unlistenChat = null;
+let unlistenConnection = null;
+let statusTimeoutId = null;
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+function shortPeerId(id) {
+  if (!id) return 'unknown';
+  return id.length > 12 ? id.slice(-8) : id;
+}
+
+function updateCurrentEvent(content) {
+  currentEvent.value = content;
+  if (statusTimeoutId) clearTimeout(statusTimeoutId);
+  statusTimeoutId = setTimeout(() => {
+    currentEvent.value = '';
+  }, 5000);
+}
+
+function scrollToBottom() {
+  if (messagesRef.value?.scrollToBottom) {
+    messagesRef.value.scrollToBottom();
+  }
+}
+
+// ============================================================================
+// CONTACT MANAGEMENT
+// ============================================================================
+
+function createContact(peerId) {
+  return {
+    peerId,
+    nickname: '',
+    messages: [],
+    unreadCount: 0,
+    lastMessage: '',
+    lastMessageTime: null,
+    status: 'connecting',
+  };
+}
+
+function addOrUpdateContact(peerId, updates = {}) {
+  if (!contacts.value.has(peerId)) {
+    contacts.value.set(peerId, createContact(peerId));
+  }
+  const contact = contacts.value.get(peerId);
+  Object.assign(contact, updates);
+  return contact;
+}
+
+function getActiveContact() {
+  if (!activeContactId.value) return null;
+  return contacts.value.get(activeContactId.value);
+}
+
+function getActiveMessages() {
+  const contact = getActiveContact();
+  return contact?.messages || [];
+}
+
+// Group chat = 2+ unique non-self senders in the message list
+const isGroupChat = computed(() => {
+  const msgs = getActiveMessages();
+  const senders = new Set(msgs.filter(m => !m.is_self).map(m => m.from));
+  return senders.size > 1;
+});
+
+function selectContact(peerId) {
+  activeContactId.value = peerId;
+  const contact = contacts.value.get(peerId);
+  if (contact) {
+    contact.unreadCount = 0;
+    scrollToBottom();
+  }
+}
+
+function openChat(peerId) {
+  selectContact(peerId);
+  showChatView.value = true;
+}
+
+// ============================================================================
+// MESSAGE HANDLING
+// ============================================================================
+
+function addMessageToContact(peerId, message) {
+  const contact = addOrUpdateContact(peerId);
+  contact.messages.push(message);
+  
+  // Update last message preview
+  contact.lastMessage = message.content.substring(0, 50) + 
+    (message.content.length > 50 ? '...' : '');
+  contact.lastMessageTime = new Date(message.timestamp).getTime();
+  
+  // Increment unread count if not active
+  if (activeContactId.value !== peerId) {
+    contact.unreadCount++;
+  }
+  
+  // Scroll if this is active contact
+  if (activeContactId.value === peerId) {
+    scrollToBottom();
+  }
+}
+
+async function sendMessage() {
+  if (!inputMessage.value.trim() || !activeContactId.value) return;
+
+  try {
+    const contact = contacts.value.get(activeContactId.value);
+    if (!contact) return;
+
+    await invoke('send_message', { 
+      peer_id: activeContactId.value,
+      message: inputMessage.value
+    });
+
+    // Don't add message locally — backend sends ChatMessage event on publish
+    inputMessage.value = '';
+  } catch (error) {
+    console.error('Failed to send message:', error);
+    updateCurrentEvent('[!] Failed to send message');
+  }
+}
+
+// ============================================================================
+// CONNECTION HANDLING
+// ============================================================================
+
+// Called when mDNS discovers a peer — adds to sidebar as available
+function handlePeerDiscovered(discoveredPeerId) {
+  console.log('[App] Peer discovered:', discoveredPeerId);
+  // Skip own peer ID
+  if (discoveredPeerId === peerID.value) return;
+  if (!contacts.value.has(discoveredPeerId)) {
+    addOrUpdateContact(discoveredPeerId, { 
+      status: 'discovered',
+      nickname: shortPeerId(discoveredPeerId),
+    });
+  }
+}
+
+// Called when user clicks Connect on a discovered peer in sidebar
+async function connectToPeer(peerId) {
+  console.log('[App] connectToPeer called for:', peerId);
+  if (!peerId) return;
+
+  // Show connecting status (NOT connected yet)
+  addOrUpdateContact(peerId, { status: 'connecting' });
+
+  try {
+    // Dial the peer via the backend — connection-established event will confirm
+    console.log('[App] Invoking request_connection for:', peerId);
+    await invoke('request_connection', { peer_id: peerId });
+    console.log('[App] ✓ Dial initiated for:', peerId);
+  } catch (error) {
+    console.error('[App] Failed to connect to peer:', error);
+    addOrUpdateContact(peerId, { status: 'discovered' });
+    updateCurrentEvent('[!] Failed to connect to peer');
+  }
+}
+
+// Called when another peer explicitly requests connection (incoming-connection event)
+function handleIncomingConnection(peerId) {
+  console.log('[App] Incoming connection request from:', peerId);
+  // Skip own peer ID
+  if (peerId === peerID.value) return;
+  // Add to contacts as a 'request' — shows in sidebar Requests section
+  if (!contacts.value.has(peerId)) {
+    addOrUpdateContact(peerId, {
+      status: 'request',
+      nickname: shortPeerId(peerId),
+    });
+  } else {
+    addOrUpdateContact(peerId, { status: 'request' });
+  }
+}
+
+async function acceptConnection(peerId) {
+  console.log('[App] acceptConnection called for peer:', peerId);
+  if (!peerId) {
+    console.error('[App] acceptConnection: No peer ID!');
+    return;
+  }
+
+  try {
+    console.log('[App] Invoking accept_connection with peer_id:', peerId);
+    await invoke('accept_connection', { peer_id: peerId });
+    console.log('[App] ✓ Backend accepted connection for:', peerId);
+    
+    addOrUpdateContact(peerId, { status: 'connected' });
+    selectContact(peerId);
+    updateCurrentEvent('Connection accepted');
+  } catch (error) {
+    console.error('[App] Failed to accept connection:', error);
+    updateCurrentEvent('[!] Failed to accept connection');
+  }
+}
+
+async function rejectConnection(peerId) {
+  console.log('[App] rejectConnection called for peer:', peerId);
+  if (!peerId) return;
+
+  try {
+    await invoke('reject_connection', { peer_id: peerId });
+    console.log('[App] Connection rejected for peer:', peerId);
+  } catch (error) {
+    console.error('[App] Failed to reject connection:', error);
+    updateCurrentEvent('[!] Failed to reject connection');
+  }
+
+  // Remove from contacts
+  contacts.value.delete(peerId);
+}
+
+// ============================================================================
+// P2P INITIALIZATION
+// ============================================================================
+
 let initializationAttempted = false;
 
-// Initialize P2P node
 async function initP2P() {
-  // Prevent multiple initialization attempts
   if (initializationAttempted) {
     console.log('P2P initialization already attempted, skipping...');
     return;
   }
   initializationAttempted = true;
-  
+  updateCurrentEvent('Initializing P2P Node');
+
   try {
     const id = await invoke('init_p2p');
     peerID.value = id;
     isInitialized.value = true;
     
-    // Fetch node info periodically
+    // Join default room for messaging
+    try {
+      await invoke('join_room', { room_name: 'general' });
+      console.log('✓ Joined room: general');
+    } catch (roomError) {
+      console.error('Failed to join room:', roomError);
+    }
+    
+    updateCurrentEvent('');
+
+    // Fetch addresses
     updateNodeInfo();
     setInterval(updateNodeInfo, 5000);
   } catch (error) {
     console.error('Failed to initialize P2P:', error);
-    addSystemMessage('❌ Failed to initialize P2P node: ' + error);
-    // Reset flag on error to allow retry if needed
+    updateCurrentEvent('[X] Failed to initialize P2P');
     initializationAttempted = false;
   }
 }
 
-// Update node info
 async function updateNodeInfo() {
   try {
     const info = await invoke('get_node_info');
     addresses.value = info.addresses;
-    connectedPeers.value = info.connected_peers;
   } catch (error) {
     console.error('Failed to get node info:', error);
   }
 }
 
-// Send message
-async function sendMessage() {
-  if (!inputMessage.value.trim()) return;
-  
-  try {
-    await invoke('send_message', { message: inputMessage.value });
-    inputMessage.value = '';
-  } catch (error) {
-    console.error('Failed to send message:', error);
-    addSystemMessage('⚠ Failed to send message: ' + error);
-  }
-}
+// ============================================================================
+// LIFECYCLE HOOKS
+// ============================================================================
 
-// Join room
-async function joinRoom() {
-  if (!roomInput.value.trim()) return;
-  
-  try {
-    await invoke('join_room', { roomName: roomInput.value });
-    currentRoom.value = roomInput.value;
-    joinRoomMode.value = false;
-    roomInput.value = '';
-  } catch (error) {
-    console.error('Failed to join room:', error);
-    addSystemMessage('⚠ Failed to join room: ' + error);
-  }
-}
+let unlistenDiscovery = null;
 
-// Connect to peer
-async function connectToPeer() {
-  if (!peerAddressInput.value.trim()) return;
-  
-  try {
-    await invoke('connect_to_peer', { addr: peerAddressInput.value });
-    connectPeerMode.value = false;
-    peerAddressInput.value = '';
-  } catch (error) {
-    console.error('Failed to connect to peer:', error);
-    addSystemMessage('⚠ Failed to connect to peer: ' + error);
-  }
-}
-
-// Add system message
-function addSystemMessage(content) {
-  messages.value.push({
-    from: 'System',
-    content,
-    timestamp: new Date().toISOString(),
-    is_self: false,
-  });
-  scrollToBottom();
-}
-
-// Scroll to bottom
-async function scrollToBottom() {
-  await nextTick();
-  if (messagesContainer.value) {
-    messagesContainer.value.scrollTop = messagesContainer.value.scrollHeight;
-  }
-}
-
-// Format timestamp
-function formatTime(timestamp) {
-  const date = new Date(timestamp);
-  return date.toLocaleTimeString('en-US', { 
-    hour: '2-digit', 
-    minute: '2-digit',
-    second: '2-digit'
-  });
-}
-
-// Short peer ID
-function shortPeerID(id) {
-  if (id.length > 16) {
-    return id.substring(0, 8) + '...' + id.substring(id.length - 6);
-  }
-  return id;
-}
-
-// Handle keyboard shortcuts
-function handleKeydown(event) {
-  if (event.ctrlKey && event.key === 'j') {
-    event.preventDefault();
-    joinRoomMode.value = true;
-  }
-  if (event.ctrlKey && event.key === 'p') {
-    event.preventDefault();
-    connectPeerMode.value = true;
-  }
-}
-
-// Copy address to clipboard
-async function copyAddress(addr, index) {
-  try {
-    await navigator.clipboard.writeText(addr);
-    copiedIndex.value = index;
-    setTimeout(() => {
-      copiedIndex.value = -1;
-    }, 2000);
-  } catch (error) {
-    console.error('Failed to copy:', error);
-  }
-}
-
-// Lifecycle hooks
 onMounted(async () => {
-  // Listen for chat messages from Rust
-  unlisten = await listen('chat-message', (event) => {
-    messages.value.push(event.payload);
-    scrollToBottom();
+  // Listen for incoming chat messages
+  unlistenChat = await listen('chat-message', (event) => {
+    const message = event.payload;
+
+    // Handle system messages in loading bar
+    if (message.from === 'System') {
+      let eventText = message.content
+        .replace(/^\[[OX!>.].*?\]\s*/g, '')
+        .replace(/^[^\w]/, '')
+        .trim();
+      updateCurrentEvent(eventText);
+    } else {
+      // Add to contact's messages
+      const peerId = message.peer_id || message.from;
+      addMessageToContact(peerId, message);
+      
+      // Update contact nickname from sender's username (if not self)
+      if (!message.is_self && message.from && message.from !== 'Unknown') {
+        const contact = contacts.value.get(peerId);
+        if (contact) {
+          contact.nickname = message.from;
+        }
+      }
+    }
   });
-  
-  // Add keyboard listener
+
+  // Listen for peer discovery (mDNS) — shows peers in sidebar
+  unlistenDiscovery = await listen('peer-discovered', (event) => {
+    const peerId = event.payload.peerId || event.payload;
+    console.log('[App] peer-discovered event:', peerId);
+    handlePeerDiscovered(peerId);
+  });
+
+  // Listen for connection established (our outgoing dial succeeded)
+  const unlistenEstablished = await listen('connection-established', (event) => {
+    const peerId = event.payload.peerId || event.payload;
+    console.log('[App] connection-established event:', peerId);
+    if (peerId === peerID.value) return;
+    addOrUpdateContact(peerId, { status: 'connected' });
+    selectContact(peerId);
+    updateCurrentEvent('Connected to peer');
+  });
+
+  // Listen for explicit incoming connections (someone dialed us)
+  unlistenConnection = await listen('incoming-connection', (event) => {
+    const peerId = event.payload.peerId || event.payload;
+    console.log('[App] incoming-connection event:', peerId);
+    handleIncomingConnection(peerId);
+  });
+
+  // Listen for peer disconnection
+  const unlistenDisconnected = await listen('peer-disconnected', (event) => {
+    const peerId = event.payload.peer_id || event.payload.peerId;
+    console.log('[App] peer-disconnected event:', peerId);
+    const contact = contacts.value.get(peerId);
+    if (contact) {
+      contact.status = 'disconnected';
+    }
+  });
+
+  // Listen for mDNS peer expiry
+  const unlistenExpired = await listen('peer-expired', (event) => {
+    const peerId = event.payload.peer_id || event.payload.peerId;
+    console.log('[App] peer-expired event:', peerId);
+    const contact = contacts.value.get(peerId);
+    if (contact && contact.status === 'discovered') {
+      contacts.value.delete(peerId);
+    }
+  });
+
   window.addEventListener('keydown', handleKeydown);
-  
-  // Initialize P2P
+
+  // Visual Viewport API — adjust height when mobile keyboard opens
+  if (window.visualViewport) {
+    const onViewportResize = () => {
+      document.documentElement.style.setProperty(
+        '--viewport-height',
+        `${window.visualViewport.height}px`
+      );
+    };
+    window.visualViewport.addEventListener('resize', onViewportResize);
+    window.visualViewport.addEventListener('scroll', onViewportResize);
+    onViewportResize(); // set initial value
+    // Store cleanup ref
+    window.__vpCleanup = () => {
+      window.visualViewport.removeEventListener('resize', onViewportResize);
+      window.visualViewport.removeEventListener('scroll', onViewportResize);
+    };
+  }
+
+  // Load saved username from localStorage
+  const savedName = localStorage.getItem('p2p_username');
+  if (savedName) {
+    username.value = savedName;
+    try {
+      await invoke('set_username', { name: savedName });
+    } catch (e) {
+      // Node may not be ready yet, will be set after init
+    }
+  }
+
   await initP2P();
+
+  // Re-set username after init if we loaded one
+  if (savedName) {
+    try {
+      await invoke('set_username', { name: savedName });
+    } catch (e) {
+      console.warn('Failed to set saved username:', e);
+    }
+  }
 });
 
 onUnmounted(async () => {
-  if (unlisten) unlisten();
+  if (unlistenChat) unlistenChat();
+  if (unlistenDiscovery) unlistenDiscovery();
+  if (unlistenConnection) unlistenConnection();
+  if (statusTimeoutId) clearTimeout(statusTimeoutId);
   window.removeEventListener('keydown', handleKeydown);
-  
-  // Cleanup P2P node
+  if (window.__vpCleanup) window.__vpCleanup();
+
   try {
     await invoke('cleanup_p2p');
   } catch (error) {
     console.error('Failed to cleanup P2P:', error);
   }
 });
+
+function handleKeydown(event) {
+  if (event.key === 'Escape') {
+    if (showConnectModal.value || showJoinModal.value) {
+      showConnectModal.value = false;
+      showJoinModal.value = false;
+    }
+  }
+}
+
+async function handleConnectPeer() {
+  const addr = peerAddressInput.value.trim();
+  if (!addr) return;
+  try {
+    await invoke('request_connection', { peer_id: addr });
+    updateCurrentEvent('Connecting to peer...');
+  } catch (error) {
+    console.error('Failed to connect:', error);
+    updateCurrentEvent('[!] ' + error);
+  }
+  peerAddressInput.value = '';
+  showConnectModal.value = false;
+}
+
+async function handleJoinRoom() {
+  const name = roomInput.value.trim();
+  if (!name) return;
+  try {
+    await invoke('join_room', { room_name: name });
+    updateCurrentEvent(`Joined room: ${name}`);
+  } catch (error) {
+    console.error('Failed to join room:', error);
+    updateCurrentEvent('[!] ' + error);
+  }
+  roomInput.value = '';
+  showJoinModal.value = false;
+}
+
+async function saveUsername() {
+  const name = username.value.trim();
+  if (!name) return;
+  try {
+    await invoke('set_username', { name });
+    localStorage.setItem('p2p_username', name);
+    updateCurrentEvent(`Name set: ${name}`);
+  } catch (error) {
+    console.error('Failed to set username:', error);
+  }
+}
 </script>
 
 <template>
-  <div class="chat-container">
-    <!-- Header -->
-    <div class="header">
-      <h1>P2P Chat</h1>
-      <div class="peer-info">
-        <div class="peer-id">
-          <span class="label">Peer ID:</span>
-          <span class="value">{{ shortPeerID(peerID) }}</span>
-        </div>
-        <div class="peers-count">
-          <span class="label">Connected Peers:</span>
-          <span class="value">{{ connectedPeers.length }}</span>
-        </div>
-        <div v-if="currentRoom" class="current-room">
-          <span class="label">Room:</span>
-          <span class="value">{{ currentRoom }}</span>
-        </div>
-      </div>
+  <div class="app-container">
+    <!-- Desktop: side-by-side layout -->
+    <!-- Mobile: list OR chat view -->
+
+    <!-- Sidebar Panel (always visible on desktop, visible on mobile when not in chat) -->
+    <div class="sidebar-panel" :class="{ 'mobile-hidden': showChatView }">
+      <Sidebar
+        ref="sidebarRef"
+        :contacts="contacts"
+        :activeContactId="activeContactId"
+        :username="username"
+        @select-contact="openChat"
+        @connect-peer="connectToPeer"
+        @accept-peer="acceptConnection"
+        @reject-peer="rejectConnection"
+        @show-connect-modal="showConnectModal = true"
+        @show-join-modal="showJoinModal = true"
+        @update:username="username = $event"
+        @save-username="saveUsername"
+      />
+      <Addresses :addresses="addresses" />
     </div>
 
-    <!-- Addresses Section -->
-    <div class="addresses-section" v-if="addresses.length > 0">
-      <div class="section-title">Listen Addresses</div>
-      <div class="addresses-list">
-        <div v-for="(addr, index) in addresses" :key="index" class="address-item">
-          <div class="address">{{ addr }}</div>
-          <button 
-            @click="copyAddress(addr, index)" 
-            class="copy-btn"
-            :class="{ copied: copiedIndex === index }"
-          >
-            {{ copiedIndex === index ? '✓ Copied' : 'Copy' }}
-          </button>
+    <!-- Chat Panel (always visible on desktop, visible on mobile when in chat) -->
+    <div class="chat-panel" :class="{ 'mobile-hidden': !showChatView }">
+      <!-- Chat Header -->
+      <div class="chat-header">
+        <button class="back-btn mobile-only" @click="showChatView = false">&lt;</button>
+        <div class="chat-header-info" v-if="getActiveContact()">
+          <span class="chat-peer-name">{{ getActiveContact().nickname }}</span>
+          <span class="chat-peer-status">{{ getActiveContact().status }}</span>
+        </div>
+        <div v-else class="chat-header-info">
+          <span class="chat-peer-name" style="color: #444;">No chat selected</span>
         </div>
       </div>
+
+      <!-- Messages -->
+      <Messages 
+        ref="messagesRef"
+        :messages="getActiveMessages()"
+        :activeContact="getActiveContact()"
+        :isGroupChat="isGroupChat"
+      />
+
+      <!-- Input Area -->
+      <InputArea
+        :inputMessage="inputMessage"
+        @update:inputMessage="inputMessage = $event"
+        :isInitialized="!!(isInitialized && activeContactId)"
+        :onSendMessage="sendMessage"
+      />
     </div>
 
-    <!-- Messages Container -->
-    <div class="messages-container" ref="messagesContainer">
-      <div
-        v-for="(msg, index) in messages"
-        :key="index"
-        :class="['message', msg.is_self ? 'self' : msg.from === 'System' ? 'system' : 'peer']"
-      >
-        <div class="message-header">
-          <span class="message-from">{{ msg.from }}</span>
-          <span class="message-time">{{ formatTime(msg.timestamp) }}</span>
-        </div>
-        <div class="message-content">{{ msg.content }}</div>
-      </div>
-      <div v-if="messages.length === 0" class="no-messages">
-        No messages yet. Press <kbd>Ctrl+J</kbd> to join a room!
-      </div>
-    </div>
+    <!-- Loading Bar (bottom) -->
+    <LoadingBar :currentEvent="currentEvent" />
 
-    <!-- Join Room Modal -->
-    <div v-if="joinRoomMode" class="modal-overlay" @click="joinRoomMode = false">
-      <div class="modal" @click.stop>
-        <h3>Join a Room</h3>
-        <input
-          v-model="roomInput"
-          @keyup.enter="joinRoom"
-          @keyup.esc="joinRoomMode = false"
-          placeholder="Enter room name..."
-          autofocus
-          class="room-input"
-        />
-        <div class="modal-buttons">
-          <button @click="joinRoom" class="btn-primary">Join</button>
-          <button @click="joinRoomMode = false; roomInput = ''" class="btn-secondary">
-            Cancel
-          </button>
-        </div>
-      </div>
-    </div>
+    <!-- Modals -->
+    <ConnectPeerModal
+      v-if="showConnectModal"
+      v-model:peerAddressInput="peerAddressInput"
+      :onConnectPeer="handleConnectPeer"
+      :onClose="() => showConnectModal = false"
+    />
 
-    <!-- Connect to Peer Modal -->
-    <div v-if="connectPeerMode" class="modal-overlay" @click="connectPeerMode = false">
-      <div class="modal" @click.stop>
-        <h3>Connect to Peer</h3>
-        <p class="modal-help">Enter the full multiaddr of the peer (e.g., /ip6/::1/tcp/8080/p2p/12D3...)</p>
-        <input
-          v-model="peerAddressInput"
-          @keyup.enter="connectToPeer"
-          @keyup.esc="connectPeerMode = false"
-          placeholder="Paste peer multiaddr..."
-          autofocus
-          class="room-input"
-        />
-        <div class="modal-buttons">
-          <button @click="connectToPeer" class="btn-primary">Connect</button>
-          <button @click="connectPeerMode = false; peerAddressInput = ''" class="btn-secondary">
-            Cancel
-          </button>
-        </div>
-      </div>
-    </div>
-
-    <!-- Input Area -->
-    <div class="input-area">
-      <div class="shortcuts">
-        <span class="shortcut"><kbd>Ctrl+J</kbd> Join Room</span>
-        <span class="shortcut"><kbd>Ctrl+P</kbd> Connect Peer</span>
-        <span class="shortcut"><kbd>Enter</kbd> Send Message</span>
-      </div>
-      <div class="input-row">
-        <textarea
-          v-model="inputMessage"
-          @keyup.enter.exact="sendMessage"
-          placeholder="Type a message..."
-          class="message-input"
-          :disabled="!isInitialized"
-          rows="3"
-        ></textarea>
-        <button @click="sendMessage" :disabled="!isInitialized || !inputMessage.trim()" class="send-button">
-          Send
-        </button>
-      </div>
-    </div>
+    <JoinRoomModal
+      v-if="showJoinModal"
+      v-model:roomInput="roomInput"
+      :onJoinRoom="handleJoinRoom"
+      :onClose="() => showJoinModal = false"
+    />
   </div>
 </template>
 
@@ -318,433 +569,138 @@ onUnmounted(async () => {
   box-sizing: border-box;
 }
 
-.chat-container {
+.app-container {
+  display: flex;
+  height: var(--viewport-height, 100vh);
+  background: #0a0a0a;
+  color: #c0c0c0;
+  font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
+  font-size: 13px;
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+  padding-left: env(safe-area-inset-left, 0px);
+  padding-right: env(safe-area-inset-right, 0px);
+}
+
+/* ===== Desktop: side-by-side ===== */
+.sidebar-panel {
+  width: 280px;
+  flex-shrink: 0;
   display: flex;
   flex-direction: column;
-  height: 100vh;
-  background: #1e1e1e;
-  color: #f0f0f0;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif;
+  overflow: hidden;
+  border-right: 1px solid #1a1a1a;
 }
 
-.header {
-  padding: 1rem 1.5rem;
-  background: #2a2a2a;
-  border-bottom: 1px solid #3a3a3a;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
-}
-
-.header h1 {
-  margin: 0 0 0.75rem 0;
-  font-size: 1.25rem;
-  font-weight: 600;
-  color: #ffffff;
-  letter-spacing: -0.015em;
-}
-
-.peer-info {
-  display: flex;
-  gap: 1.5rem;
-  flex-wrap: wrap;
-  font-size: 0.8125rem;
-}
-
-.peer-info > div {
-  display: flex;
-  gap: 0.5rem;
-  align-items: center;
-}
-
-.label {
-  color: #a0a0a0;
-  font-weight: 500;
-}
-
-.value {
-  color: #ffffff;
-  font-family: 'SF Mono', Monaco, 'Cascadia Code', 'Roboto Mono', Consolas, monospace;
-  background: #353535;
-  padding: 0.25rem 0.5rem;
-  border-radius: 6px;
-  font-size: 0.75rem;
-  border: 1px solid #3a3a3a;
-}
-
-.addresses-section {
-  padding: 0.75rem 1.5rem;
-  background: #252525;
-  border-bottom: 1px solid #3a3a3a;
-}
-
-.section-title {
-  font-weight: 600;
-  color: #60a5fa;
-  margin-bottom: 0.5rem;
-  font-size: 0.8125rem;
-}
-
-.addresses-list {
-  display: flex;
-  flex-direction: column;
-  gap: 0.5rem;
-}
-
-.address-item {
-  display: flex;
-  gap: 0.5rem;
-  align-items: center;
-}
-
-.address {
+.sidebar-panel :deep(.sidebar) {
+  width: 100% !important;
+  max-height: none !important;
   flex: 1;
-  font-family: 'SF Mono', Monaco, 'Cascadia Code', 'Roboto Mono', Consolas, monospace;
-  font-size: 0.6875rem;
-  color: #b0b0b0;
-  background: #2a2a2a;
+  border-right: none;
+}
+
+.sidebar-panel :deep(.addresses-section) {
+  flex-shrink: 0;
+}
+
+.chat-panel {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.chat-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
   padding: 0.5rem 0.75rem;
-  border-radius: 6px;
-  overflow-x: auto;
-  border: 1px solid #3a3a3a;
+  background: #111;
+  border-bottom: 1px solid #1a1a1a;
+  flex-shrink: 0;
 }
 
-.copy-btn {
-  padding: 0.375rem 0.75rem;
-  font-size: 0.75rem;
-  font-weight: 600;
-  background: #353535;
-  color: #f0f0f0;
-  border: 1px solid #3a3a3a;
-  border-radius: 6px;
+.back-btn {
+  width: 28px;
+  height: 28px;
+  border: 1px solid #333;
+  border-radius: 2px;
+  background: transparent;
+  color: #00ff41;
+  font-family: inherit;
+  font-size: 0.875rem;
+  font-weight: 700;
   cursor: pointer;
-  transition: all 0.15s ease;
-  white-space: nowrap;
-}
-
-.copy-btn:hover {
-  background: #404040;
-  border-color: #60a5fa;
-}
-
-.copy-btn.copied {
-  background: #00a884;
-  color: #ffffff;
-  border-color: #00a884;
-}
-
-.messages-container {
-  flex: 1;
-  overflow-y: auto;
-  padding: 1rem 1.5rem;
-  display: flex;
-  flex-direction: column;
-  gap: 0.75rem;
-  background: #1e1e1e;
-}
-
-.messages-container::-webkit-scrollbar {
-  width: 12px;
-}
-
-.messages-container::-webkit-scrollbar-track {
-  background: #1e1e1e;
-}
-
-.messages-container::-webkit-scrollbar-thumb {
-  background: #404040;
-  border-radius: 6px;
-  border: 3px solid #1e1e1e;
-}
-
-.messages-container::-webkit-scrollbar-thumb:hover {
-  background: #505050;
-}
-
-.message {
-  padding: 0.75rem 1rem;
-  border-radius: 8px;
-  max-width: 70%;
-  animation: slideIn 0.2s ease;
-  border: 1px solid transparent;
-}
-
-@keyframes slideIn {
-  from {
-    opacity: 0;
-    transform: translateY(5px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-
-.message.self {
-  align-self: flex-end;
-  background: #005c4b;
-  color: #ffffff;
-  border-color: #005c4b;
-}
-
-.message.peer {
-  align-self: flex-start;
-  background: #2a2a2a;
-  color: #f0f0f0;
-  border-color: #3a3a3a;
-}
-
-.message.system {
-  align-self: center;
-  background: rgba(96, 165, 250, 0.15);
-  border: 1px solid #60a5fa;
-  color: #60a5fa;
-  max-width: 85%;
-  font-size: 0.8125rem;
-  text-align: center;
-}
-
-.message-header {
-  display: flex;
-  justify-content: space-between;
-  margin-bottom: 0.375rem;
-  font-size: 0.75rem;
-  opacity: 0.9;
-}
-
-.message-from {
-  font-weight: 600;
-}
-
-.message-time {
-  font-family: 'SF Mono', Monaco, 'Cascadia Code', 'Roboto Mono', Consolas, monospace;
-  opacity: 0.7;
-}
-
-.message-content {
-  font-size: 0.875rem;
-  line-height: 1.5;
-  word-wrap: break-word;
-}
-
-.no-messages {
-  text-align: center;
-  color: #a0a0a0;
-  padding: 3rem;
-  font-size: 0.875rem;
-}
-
-.modal-overlay {
-  position: fixed;
-  top: 0;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  background: rgba(0, 0, 0, 0.75);
-  backdrop-filter: blur(4px);
   display: flex;
   align-items: center;
   justify-content: center;
-  z-index: 1000;
-  animation: fadeIn 0.15s ease;
+  transition: all 0.1s ease;
+  flex-shrink: 0;
 }
 
-@keyframes fadeIn {
-  from { opacity: 0; }
-  to { opacity: 1; }
+.back-btn:hover {
+  background: #1a1a1a;
+  border-color: #00ff41;
 }
 
-.modal {
-  background: #2a2a2a;
-  padding: 1.5rem;
-  border-radius: 12px;
-  min-width: 450px;
-  border: 1px solid #3a3a3a;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.6);
-  animation: scaleIn 0.2s ease;
+/* Hide back button on desktop */
+.mobile-only {
+  display: none;
 }
 
-@keyframes scaleIn {
-  from {
-    transform: scale(0.95);
-    opacity: 0;
-  }
-  to {
-    transform: scale(1);
-    opacity: 1;
-  }
-}
-
-.modal h3 {
-  margin: 0 0 1rem 0;
-  color: #ffffff;
-  font-size: 1.125rem;
-  font-weight: 600;
-}
-
-.modal-help {
-  margin: 0 0 1rem 0;
-  color: #a0a0a0;
-  font-size: 0.8125rem;
-  line-height: 1.5;
-}
-
-.room-input {
-  width: 100%;
-  padding: 0.625rem 0.75rem;
-  font-size: 0.875rem;
-  border: 1px solid #3a3a3a;
-  border-radius: 6px;
-  background: #1e1e1e;
-  color: #f0f0f0;
-  margin-bottom: 1rem;
-  font-family: inherit;
-  transition: all 0.15s ease;
-}
-
-.room-input:focus {
-  outline: none;
-  border-color: #60a5fa;
-  box-shadow: 0 0 0 3px rgba(96, 165, 250, 0.25);
-}
-
-.modal-buttons {
+.chat-header-info {
   display: flex;
-  gap: 0.75rem;
-  justify-content: flex-end;
+  flex-direction: column;
+  gap: 0.0625rem;
+  min-width: 0;
 }
 
-.input-area {
-  padding: 1rem 1.5rem;
-  background: #2a2a2a;
-  border-top: 1px solid #3a3a3a;
-}
-
-.shortcuts {
-  display: flex;
-  gap: 1.25rem;
-  margin-bottom: 0.75rem;
+.chat-peer-name {
+  color: #c0c0c0;
   font-size: 0.75rem;
-  flex-wrap: wrap;
-}
-
-.shortcut {
-  color: #a0a0a0;
-  display: flex;
-  align-items: center;
-  gap: 0.375rem;
-}
-
-kbd {
-  background: #353535;
-  color: #f0f0f0;
-  padding: 0.125rem 0.375rem;
-  border-radius: 4px;
-  font-size: 0.6875rem;
-  font-weight: 600;
-  border: 1px solid #404040;
-  font-family: 'SF Mono', Monaco, 'Cascadia Code', 'Roboto Mono', Consolas, monospace;
-}
-
-.input-row {
-  display: flex;
-  gap: 0.75rem;
-  align-items: flex-end;
-}
-
-.message-input {
-  flex: 1;
-  padding: 0.625rem 0.75rem;
-  font-size: 0.875rem;
-  border: 1px solid #3a3a3a;
-  border-radius: 6px;
-  background: #1e1e1e;
-  color: #f0f0f0;
-  font-family: inherit;
-  resize: none;
-  transition: all 0.15s ease;
-  line-height: 1.5;
-}
-
-.message-input:focus {
-  outline: none;
-  border-color: #60a5fa;
-  box-shadow: 0 0 0 3px rgba(96, 165, 250, 0.25);
-}
-
-.message-input:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-  background: #252525;
-}
-
-.message-input::placeholder {
-  color: #808080;
-}
-
-.send-button,
-.btn-primary,
-.btn-secondary {
-  padding: 0.5rem 1.25rem;
-  font-size: 0.875rem;
-  font-weight: 600;
-  border: none;
-  border-radius: 6px;
-  cursor: pointer;
-  transition: all 0.15s ease;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  overflow: hidden;
   white-space: nowrap;
 }
 
-.send-button,
-.btn-primary {
-  background: #00a884;
-  color: #ffffff;
-  border: 1px solid rgba(255, 255, 255, 0.1);
+.chat-peer-status {
+  color: #555;
+  font-size: 0.5625rem;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
 }
 
-.send-button:hover:not(:disabled),
-.btn-primary:hover {
-  background: #00c896;
-}
+/* ===== Mobile (<=640px): list OR chat ===== */
+@media (max-width: 640px) {
+  .app-container {
+    flex-direction: column;
+  }
 
-.send-button:active:not(:disabled),
-.btn-primary:active {
-  background: #008c6f;
-  box-shadow: inset 0 1px 0 rgba(0, 0, 0, 0.2);
-}
+  .sidebar-panel {
+    width: 100%;
+    flex: 1;
+    border-right: none;
+  }
 
-.send-button:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-  background: #353535;
-  color: #808080;
-}
+  .chat-panel {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: var(--viewport-height, 100vh);
+    z-index: 10;
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    background: #0a0a0a;
+  }
 
-.btn-secondary {
-  background: transparent;
-  color: #f0f0f0;
-  border: 1px solid #3a3a3a;
-}
+  .mobile-hidden {
+    display: none !important;
+  }
 
-.btn-secondary:hover {
-  background: #353535;
-  border-color: #404040;
-}
-
-.btn-secondary:active {
-  background: #2a2a2a;
-}
-
-.current-room {
-  color: #4ade80;
-}
-
-.current-room .label {
-  color: #a0a0a0;
-}
-
-.current-room .value {
-  background: rgba(74, 222, 128, 0.15);
-  border-color: #4ade80;
-  color: #4ade80;
+  .mobile-only {
+    display: flex;
+  }
 }
 </style>
-

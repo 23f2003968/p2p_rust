@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">p2p_rust</string>
+    <string name="main_activity_title">p2p_rust</string>
+</resources>
